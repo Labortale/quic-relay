@@ -95,3 +95,32 @@ func TestClassifyPacket(t *testing.T) {
 		})
 	}
 }
+
+func TestExtractCryptoFramesFromPacket_RejectsOversizedSCID(t *testing.T) {
+	packet := []byte{
+		0xC0,
+		0x00, 0x00, 0x00, 0x01,
+		0x00,
+		0x20,
+	}
+
+	_, err := ExtractCryptoFramesFromPacket(packet)
+	if err == nil {
+		t.Fatal("expected oversized SCID to return an error")
+	}
+}
+
+func TestExtractCryptoFramesFromPacket_RejectsOversizedToken(t *testing.T) {
+	packet := []byte{
+		0xC0,
+		0x00, 0x00, 0x00, 0x01,
+		0x00,
+		0x00,
+		0x40, 0x01,
+	}
+
+	_, err := ExtractCryptoFramesFromPacket(packet)
+	if err == nil {
+		t.Fatal("expected oversized token to return an error")
+	}
+}
