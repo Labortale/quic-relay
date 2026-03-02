@@ -303,3 +303,14 @@ func TestContext_Concurrent(t *testing.T) {
 
 	// If we get here without race detector complaints, test passes
 }
+
+func TestLogSNIHandler_Name(t *testing.T) {
+	h, err := NewLogSNIHandler(nil)
+	if err != nil {
+		t.Fatalf("failed to create logsni handler: %v", err)
+	}
+
+	if h.Name() != "logsni" {
+		t.Fatalf("expected handler name logsni, got %q", h.Name())
+	}
+}
