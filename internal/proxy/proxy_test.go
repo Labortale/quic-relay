@@ -280,3 +280,57 @@ func TestLoadAndDeletePendingBuffer_DecrementsCount(t *testing.T) {
 		t.Fatalf("expected pendingCount=0 after delete, got %d", got)
 	}
 }
+
+func TestHandlePacket_DoesNotRebindSessionToNewClientAddressByDefault(t *testing.T) {
+	p := New(":0", handler.NewChain())
+	originalAddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345}
+	newAddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 2), Port: 23456}
+	ctx := &handler.Context{
+		Session: &handler.Session{
+			DCID: []byte("dcid-1"),
+		},
+	}
+	ctx.Session.SetClientAddr(originalAddr)
+
+	p.sessions.Store("dcid-1", ctx)
+	p.clientSessions.Store(originalAddr.String(), "dcid-1")
+
+	packet := append([]byte{0x40}, []byte("dcid-1payload")...)
+	p.handlePacket(newAddr, packet)
+
+	currentAddr := ctx.Session.ClientAddr()
+	if !currentAddr.IP.Equal(originalAddr.IP) || currentAddr.Port != originalAddr.Port {
+		t.Fatal("expected session client address to remain unchanged")
+	}
+	if _, ok := p.clientSessions.Load(newAddr.String()); ok {
+		t.Fatal("expected new client address to not be associated with the session")
+	}
+}
+
+func TestHandlePacket_RebindsSessionWhenMigrationEnabled(t *testing.T) {
+	p := New(":0", handler.NewChain())
+	p.SetAllowConnectionMigration(true)
+
+	originalAddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345}
+	newAddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 2), Port: 23456}
+	ctx := &handler.Context{
+		Session: &handler.Session{
+			DCID: []byte("dcid-1"),
+		},
+	}
+	ctx.Session.SetClientAddr(originalAddr)
+
+	p.sessions.Store("dcid-1", ctx)
+	p.clientSessions.Store(originalAddr.String(), "dcid-1")
+
+	packet := append([]byte{0x40}, []byte("dcid-1payload")...)
+	p.handlePacket(newAddr, packet)
+
+	currentAddr := ctx.Session.ClientAddr()
+	if !currentAddr.IP.Equal(newAddr.IP) || currentAddr.Port != newAddr.Port {
+		t.Fatal("expected session client address to be updated when migration is enabled")
+	}
+	if _, ok := p.clientSessions.Load(newAddr.String()); !ok {
+		t.Fatal("expected new client address to be associated with the session")
+	}
+}

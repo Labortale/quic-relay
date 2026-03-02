@@ -25,6 +25,7 @@ type Config struct {
 	Listen         string                  `json:"listen"`
 	Handlers       []handler.HandlerConfig `json:"handlers"`
 	SessionTimeout int                     `json:"session_timeout,omitempty"` // Idle timeout in seconds (default: 600)
+	AllowConnectionMigration bool          `json:"allow_connection_migration,omitempty"`
 }
 
 // LoadConfig loads configuration from a JSON file.
@@ -253,6 +254,7 @@ type Proxy struct {
 	conn           *net.UDPConn
 	chain          atomic.Pointer[handler.Chain] // Atomic for hot reload
 	sessionTimeout atomic.Int64                  // Idle timeout in seconds (atomic for hot reload)
+	allowConnectionMigration atomic.Bool         // Whether established sessions may rebind to new client addresses
 	sessions       sync.Map                      // DCID (string) -> *handler.Context
 	sessionCount   atomic.Int64                  // O(1) session counter
 	assemblers     sync.Map                      // DCID (string) -> *CryptoAssembler
@@ -294,6 +296,13 @@ func (p *Proxy) SetSessionTimeout(seconds int) {
 		seconds = defaultSessionTimeout
 	}
 	p.sessionTimeout.Store(int64(seconds))
+}
+
+// SetAllowConnectionMigration updates whether live sessions may rebind to a new
+// client address. Disabled by default because this proxy does not validate QUIC
+// migration paths before accepting them.
+func (p *Proxy) SetAllowConnectionMigration(allow bool) {
+	p.allowConnectionMigration.Store(allow)
 }
 
 // ReloadChain atomically replaces the handler chain.
@@ -381,9 +390,16 @@ func (p *Proxy) handlePacket(clientAddr *net.UDPAddr, packet []byte) {
 	// 1. Try to find existing session by DCID (with client address fallback)
 	ctx, dcid := p.findSession(packet, pktType, clientAddr)
 	if ctx != nil {
-		// Connection Migration: update client address if changed (atomic)
+		// Reject rebinding established sessions to a new client address unless
+		// explicitly enabled. This proxy does not validate QUIC migration paths.
 		currentAddr := ctx.Session.ClientAddr()
 		if !currentAddr.IP.Equal(clientAddr.IP) || currentAddr.Port != clientAddr.Port {
+			if !p.allowConnectionMigration.Load() {
+				log.Printf("[proxy] dropping packet from unexpected client address: %s (expected %s, DCID=%x)",
+					clientAddr, currentAddr, ctx.Session.DCID)
+				return
+			}
+
 			log.Printf("[proxy] connection migration: %s -> %s (DCID=%x)",
 				currentAddr, clientAddr, ctx.Session.DCID)
 			ctx.Session.SetClientAddr(clientAddr)
