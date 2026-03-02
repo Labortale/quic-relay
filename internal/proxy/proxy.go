@@ -267,6 +267,9 @@ type Proxy struct {
 	workerPool     *WorkerPool
 	ctx            context.Context
 	cancel         context.CancelFunc
+	chainRefsMu    sync.Mutex
+	chainRefs      map[*handler.Chain]int
+	retiredChains  map[*handler.Chain]struct{}
 
 	// DCID length tracking for Short Header parsing
 	dcidLengths   map[int]struct{}
@@ -279,12 +282,15 @@ const defaultSessionTimeout = 7200 // 2 hours in seconds
 func New(listenAddr string, chain *handler.Chain) *Proxy {
 	ctx, cancel := context.WithCancel(context.Background())
 	p := &Proxy{
-		listenAddr:  listenAddr,
-		dcidLengths: make(map[int]struct{}),
-		ctx:         ctx,
-		cancel:      cancel,
+		listenAddr:   listenAddr,
+		dcidLengths:  make(map[int]struct{}),
+		ctx:          ctx,
+		cancel:       cancel,
+		chainRefs:    make(map[*handler.Chain]int),
+		retiredChains: make(map[*handler.Chain]struct{}),
 	}
 	p.chain.Store(chain)
+	p.chainRefs[chain] = 0
 	p.sessionTimeout.Store(defaultSessionTimeout)
 	return p
 }
@@ -308,7 +314,18 @@ func (p *Proxy) SetAllowConnectionMigration(allow bool) {
 // ReloadChain atomically replaces the handler chain.
 // Existing sessions continue with their established connections.
 func (p *Proxy) ReloadChain(chain *handler.Chain) {
+	oldChain := p.chain.Load()
 	p.chain.Store(chain)
+
+	p.chainRefsMu.Lock()
+	if _, ok := p.chainRefs[chain]; !ok {
+		p.chainRefs[chain] = 0
+	}
+	p.chainRefsMu.Unlock()
+
+	if oldChain != nil && oldChain != chain {
+		p.retireChain(oldChain)
+	}
 }
 
 // Run starts the proxy server.
@@ -413,7 +430,7 @@ func (p *Proxy) handlePacket(clientAddr *net.UDPAddr, packet []byte) {
 		}
 
 		// Forward packet through handler chain
-		result := p.chain.Load().OnPacket(ctx, packet, handler.Inbound)
+		result := p.contextChain(ctx).OnPacket(ctx, packet, handler.Inbound)
 		if result.Action == handler.Drop && result.Error != nil {
 			log.Printf("[proxy] packet dropped: %v", result.Error)
 		}
@@ -491,6 +508,7 @@ func (p *Proxy) handlePacket(clientAddr *net.UDPAddr, packet []byte) {
 	log.Printf("[proxy] new connection: SNI=%q DCID=%x", hello.SNI, dcid)
 
 	// Create context with DCID
+	currentChain := p.chain.Load()
 	newCtx := &handler.Context{
 		ClientAddr:    clientAddr,
 		InitialPacket: packet,
@@ -500,6 +518,7 @@ func (p *Proxy) handlePacket(clientAddr *net.UDPAddr, packet []byte) {
 	// Set session count for rate limiters
 	newCtx.Set("_session_count", p.sessionCount.Load())
 	newCtx.Set("_reserve_session_slot", p.tryReserveSessionSlot)
+	newCtx.Set("_chain", currentChain)
 
 	// Set callback to learn server's SCID(s) from response packets
 	// This enables routing subsequent client packets that use server's CID
@@ -508,7 +527,7 @@ func (p *Proxy) handlePacket(clientAddr *net.UDPAddr, packet []byte) {
 	}
 
 	// Process through handler chain
-	result := p.chain.Load().OnConnect(newCtx)
+	result := currentChain.OnConnect(newCtx)
 	if result.Action == handler.Drop {
 		p.releaseReservedSessionSlot(newCtx)
 		if result.Error != nil {
@@ -527,6 +546,7 @@ func (p *Proxy) handlePacket(clientAddr *net.UDPAddr, packet []byte) {
 
 		// Store session by DCID
 		p.storeSession(dcidKey, newCtx)
+		p.retainChain(currentChain)
 
 		// Also store by client address for fallback lookup
 		// (handles cases where client uses CIDs we don't know about)
@@ -538,7 +558,7 @@ func (p *Proxy) handlePacket(clientAddr *net.UDPAddr, packet []byte) {
 
 		// Set DropSession callback for immediate session termination by handlers
 		newCtx.DropSession = func() {
-			p.chain.Load().OnDisconnect(newCtx)
+			p.contextChain(newCtx).OnDisconnect(newCtx)
 			p.deleteSession(dcidKey, newCtx)
 		}
 	} else {
@@ -709,10 +729,15 @@ func (p *Proxy) Stop() {
 	// 4. Cleanup all sessions (now safe - no more packet processing)
 	p.sessions.Range(func(key, value any) bool {
 		ctx := value.(*handler.Context)
-		p.chain.Load().OnDisconnect(ctx)
+		p.contextChain(ctx).OnDisconnect(ctx)
 		p.deleteSession(key.(string), ctx)
 		return true
 	})
+
+	p.shutdownRetiredChains()
+	if current := p.chain.Load(); current != nil {
+		p.shutdownChain(current)
+	}
 }
 
 // cleanupSessions periodically removes stale sessions and expired assemblers.
@@ -732,7 +757,7 @@ func (p *Proxy) cleanupSessions() {
 				if ctx.Session != nil {
 					if ctx.Session.IdleDuration() > timeout {
 						log.Printf("[proxy] cleaning up idle session: %s (idle %v)", key, ctx.Session.IdleDuration())
-						p.chain.Load().OnDisconnect(ctx)
+						p.contextChain(ctx).OnDisconnect(ctx)
 						p.deleteSession(key.(string), ctx)
 					}
 				}
@@ -835,6 +860,15 @@ func (p *Proxy) SessionCount() int {
 	return int(p.sessionCount.Load())
 }
 
+func (p *Proxy) contextChain(ctx *handler.Context) *handler.Chain {
+	if ctx != nil {
+		if chain, ok := handler.GetValue[*handler.Chain](ctx, "_chain"); ok && chain != nil {
+			return chain
+		}
+	}
+	return p.chain.Load()
+}
+
 // tryReserveSessionSlot atomically reserves one session slot if below limit.
 func (p *Proxy) tryReserveSessionSlot(limit int64) bool {
 	for {
@@ -863,6 +897,7 @@ func (p *Proxy) deleteSession(key string, ctx *handler.Context) {
 	if _, loaded := p.sessions.LoadAndDelete(key); loaded {
 		p.sessionCount.Add(-1)
 		p.deleteSessionAliases(key)
+		p.releaseChain(ctx)
 
 		// O(1) - directly delete using known client address from context
 		if ctx != nil && ctx.Session != nil {
@@ -889,6 +924,88 @@ func (p *Proxy) storeSession(key string, ctx *handler.Context) {
 	}
 
 	p.sessions.Store(key, ctx)
+}
+
+func (p *Proxy) retainChain(chain *handler.Chain) {
+	if chain == nil {
+		return
+	}
+	p.chainRefsMu.Lock()
+	p.chainRefs[chain]++
+	p.chainRefsMu.Unlock()
+}
+
+func (p *Proxy) releaseChain(ctx *handler.Context) {
+	chain := p.contextChain(ctx)
+	if chain == nil {
+		return
+	}
+
+	var shutdown bool
+	p.chainRefsMu.Lock()
+	if refs, ok := p.chainRefs[chain]; ok {
+		if refs > 0 {
+			refs--
+			p.chainRefs[chain] = refs
+		}
+		if refs == 0 {
+			if _, retired := p.retiredChains[chain]; retired {
+				delete(p.retiredChains, chain)
+				delete(p.chainRefs, chain)
+				shutdown = true
+			}
+		}
+	}
+	p.chainRefsMu.Unlock()
+
+	if shutdown {
+		p.shutdownChain(chain)
+	}
+}
+
+func (p *Proxy) retireChain(chain *handler.Chain) {
+	if chain == nil {
+		return
+	}
+
+	var shutdown bool
+	p.chainRefsMu.Lock()
+	refs := p.chainRefs[chain]
+	if refs == 0 {
+		delete(p.chainRefs, chain)
+		shutdown = true
+	} else {
+		p.retiredChains[chain] = struct{}{}
+	}
+	p.chainRefsMu.Unlock()
+
+	if shutdown {
+		p.shutdownChain(chain)
+	}
+}
+
+func (p *Proxy) shutdownRetiredChains() {
+	p.chainRefsMu.Lock()
+	chains := make([]*handler.Chain, 0, len(p.retiredChains))
+	for chain := range p.retiredChains {
+		chains = append(chains, chain)
+		delete(p.retiredChains, chain)
+		delete(p.chainRefs, chain)
+	}
+	p.chainRefsMu.Unlock()
+
+	for _, chain := range chains {
+		p.shutdownChain(chain)
+	}
+}
+
+func (p *Proxy) shutdownChain(chain *handler.Chain) {
+	if chain == nil {
+		return
+	}
+	if err := chain.Shutdown(context.Background()); err != nil {
+		log.Printf("[proxy] handler shutdown failed: %v", err)
+	}
 }
 
 // trackSessionAlias records an alias for later cleanup when the session ends.
@@ -1079,7 +1196,7 @@ func (p *Proxy) cleanupOldestSessions(n int) {
 		age := heap.Pop(h).(sessionAge)
 		if val, ok := p.sessions.Load(age.key); ok {
 			ctx := val.(*handler.Context)
-			p.chain.Load().OnDisconnect(ctx)
+			p.contextChain(ctx).OnDisconnect(ctx)
 			p.deleteSession(age.key, ctx)
 			removed++
 		}

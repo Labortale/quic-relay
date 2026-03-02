@@ -1,11 +1,29 @@
 package proxy
 
 import (
+	"context"
 	"net"
 	"quic-relay/internal/handler"
 	"testing"
 	"time"
 )
+
+type shutdownTestHandler struct {
+	shutdownCalled bool
+}
+
+func (h *shutdownTestHandler) Name() string { return "shutdown-test" }
+func (h *shutdownTestHandler) OnConnect(ctx *handler.Context) handler.Result {
+	return handler.Result{Action: handler.Continue}
+}
+func (h *shutdownTestHandler) OnPacket(ctx *handler.Context, packet []byte, dir handler.Direction) handler.Result {
+	return handler.Result{Action: handler.Continue}
+}
+func (h *shutdownTestHandler) OnDisconnect(ctx *handler.Context) {}
+func (h *shutdownTestHandler) Shutdown(ctx context.Context) error {
+	h.shutdownCalled = true
+	return nil
+}
 
 func TestCryptoAssembler_AddFrame(t *testing.T) {
 	assembler := NewCryptoAssembler()
@@ -332,5 +350,20 @@ func TestHandlePacket_RebindsSessionWhenMigrationEnabled(t *testing.T) {
 	}
 	if _, ok := p.clientSessions.Load(newAddr.String()); !ok {
 		t.Fatal("expected new client address to be associated with the session")
+	}
+}
+
+func TestReloadChain_ShutsDownRetiredChainWithoutSessions(t *testing.T) {
+	oldHandler := &shutdownTestHandler{}
+	newHandler := &shutdownTestHandler{}
+
+	p := New(":0", handler.NewChain(oldHandler))
+	p.ReloadChain(handler.NewChain(newHandler))
+
+	if !oldHandler.shutdownCalled {
+		t.Fatal("expected old chain resources to be shut down on reload")
+	}
+	if newHandler.shutdownCalled {
+		t.Fatal("did not expect new chain to be shut down")
 	}
 }
