@@ -357,6 +357,11 @@ func (p *Proxy) Run() error {
 // Uses QUIC Connection ID (DCID) for session lookup instead of IP:Port.
 // This enables Connection Migration (RFC 9000 Section 9).
 func (p *Proxy) handlePacket(clientAddr *net.UDPAddr, packet []byte) {
+	if len(packet) == 0 {
+		debug.Printf(" received empty packet from %s", clientAddr)
+		return
+	}
+
 	// DEBUG: Log packet reception
 	debug.Printf(" received %d bytes from %s, first byte: 0x%02x", len(packet), clientAddr, packet[0])
 

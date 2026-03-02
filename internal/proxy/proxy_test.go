@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"net"
 	"quic-relay/internal/handler"
 	"testing"
 	"time"
@@ -177,4 +178,12 @@ func TestBufferPool(t *testing.T) {
 
 	// PutBuffer with nil should not panic
 	handler.PutBuffer(nil)
+}
+
+func TestHandlePacket_EmptyPacketDoesNotPanic(t *testing.T) {
+	p := New(":0", handler.NewChain())
+	clientAddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345}
+
+	p.handlePacket(clientAddr, nil)
+	p.handlePacket(clientAddr, []byte{})
 }
