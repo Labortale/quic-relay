@@ -249,6 +249,7 @@ type Proxy struct {
 	sessions       sync.Map                      // DCID (string) -> *handler.Context
 	sessionCount   atomic.Int64                  // O(1) session counter
 	assemblers     sync.Map                      // DCID (string) -> *CryptoAssembler
+	assemblerCount atomic.Int64                  // O(1) assembler counter for hard memory cap
 	pendingPackets sync.Map                      // DCID (string) -> *pendingBuffer (out-of-order packets)
 	dcidAliases    sync.Map                      // Server SCID (string) -> original DCID (string)
 	clientSessions sync.Map                      // Client address (string) -> original DCID (string)
@@ -419,14 +420,20 @@ func (p *Proxy) handlePacket(clientAddr *net.UDPAddr, packet []byte) {
 	dcidKey := string(dcid)
 
 	// 3. Try to parse ClientHello from Initial packet
-	assemblerVal, loaded := p.assemblers.LoadOrStore(dcidKey, NewCryptoAssembler())
-	assembler := assemblerVal.(*CryptoAssembler)
+	assembler, loaded, ok := p.loadOrCreateAssembler(dcidKey)
+	if !ok {
+		debug.Printf(" assembler limit reached, dropping Initial for DCID=%x", dcid)
+		return
+	}
 
 	// Check for expired assembler
 	if loaded && assembler.IsExpired() {
-		p.assemblers.Delete(dcidKey)
+		p.deleteAssembler(dcidKey)
 		assembler = NewCryptoAssembler()
-		p.assemblers.Store(dcidKey, assembler)
+		if !p.storeAssembler(dcidKey, assembler) {
+			debug.Printf(" assembler limit reached while replacing expired assembler for DCID=%x", dcid)
+			return
+		}
 	}
 
 	// If assembler is complete, we already have the ClientHello
@@ -454,7 +461,7 @@ func (p *Proxy) handlePacket(clientAddr *net.UDPAddr, packet []byte) {
 	debug.Printf(" parsed ClientHello: SNI=%q ALPN=%v", hello.SNI, hello.ALPNProtocols)
 
 	// Clean up assembler
-	p.assemblers.Delete(dcidKey)
+	p.deleteAssembler(dcidKey)
 
 	log.Printf("[proxy] new connection: SNI=%q DCID=%x", hello.SNI, dcid)
 
@@ -707,7 +714,7 @@ func (p *Proxy) cleanupSessions() {
 			p.assemblers.Range(func(key, value any) bool {
 				assembler := value.(*CryptoAssembler)
 				if assembler.IsExpired() {
-					p.assemblers.Delete(key)
+					p.deleteAssembler(key.(string))
 				} else {
 					assemblerCount++
 				}
@@ -720,7 +727,7 @@ func (p *Proxy) cleanupSessions() {
 				p.assemblers.Range(func(key, value any) bool {
 					assembler := value.(*CryptoAssembler)
 					if assembler.IsComplete() || time.Since(assembler.createdAt) > 2*time.Second {
-						p.assemblers.Delete(key)
+						p.deleteAssembler(key.(string))
 					}
 					return true
 				})
@@ -735,6 +742,51 @@ func (p *Proxy) cleanupSessions() {
 				return true
 			})
 		}
+	}
+}
+
+// loadOrCreateAssembler returns the existing assembler for a DCID or creates one
+// while enforcing a hard global cap on outstanding assemblers.
+func (p *Proxy) loadOrCreateAssembler(key string) (*CryptoAssembler, bool, bool) {
+	if val, ok := p.assemblers.Load(key); ok {
+		return val.(*CryptoAssembler), true, true
+	}
+
+	assembler := NewCryptoAssembler()
+	if !p.storeAssembler(key, assembler) {
+		if val, ok := p.assemblers.Load(key); ok {
+			return val.(*CryptoAssembler), true, true
+		}
+		return nil, false, false
+	}
+
+	return assembler, false, true
+}
+
+// storeAssembler stores a new assembler if the hard cap allows it.
+func (p *Proxy) storeAssembler(key string, assembler *CryptoAssembler) bool {
+	for {
+		count := p.assemblerCount.Load()
+		if count >= maxAssemblers {
+			return false
+		}
+		if p.assemblerCount.CompareAndSwap(count, count+1) {
+			break
+		}
+	}
+
+	if _, loaded := p.assemblers.LoadOrStore(key, assembler); loaded {
+		p.assemblerCount.Add(-1)
+		return false
+	}
+
+	return true
+}
+
+// deleteAssembler removes an assembler and decrements the counter once.
+func (p *Proxy) deleteAssembler(key string) {
+	if _, loaded := p.assemblers.LoadAndDelete(key); loaded {
+		p.assemblerCount.Add(-1)
 	}
 }
 

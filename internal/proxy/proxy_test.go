@@ -187,3 +187,35 @@ func TestHandlePacket_EmptyPacketDoesNotPanic(t *testing.T) {
 	p.handlePacket(clientAddr, nil)
 	p.handlePacket(clientAddr, []byte{})
 }
+
+func TestStoreAssembler_EnforcesHardCap(t *testing.T) {
+	p := New(":0", handler.NewChain())
+	p.assemblerCount.Store(maxAssemblers)
+
+	if p.storeAssembler("dcid-1", NewCryptoAssembler()) {
+		t.Fatal("expected storeAssembler to reject inserts at hard cap")
+	}
+
+	if _, ok := p.assemblers.Load("dcid-1"); ok {
+		t.Fatal("assembler should not be stored when cap is reached")
+	}
+}
+
+func TestDeleteAssembler_DecrementsCount(t *testing.T) {
+	p := New(":0", handler.NewChain())
+
+	if !p.storeAssembler("dcid-1", NewCryptoAssembler()) {
+		t.Fatal("expected assembler to be stored")
+	}
+
+	if got := p.assemblerCount.Load(); got != 1 {
+		t.Fatalf("expected assemblerCount=1, got %d", got)
+	}
+
+	p.deleteAssembler("dcid-1")
+	p.deleteAssembler("dcid-1")
+
+	if got := p.assemblerCount.Load(); got != 0 {
+		t.Fatalf("expected assemblerCount=0 after delete, got %d", got)
+	}
+}
