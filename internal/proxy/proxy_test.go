@@ -340,6 +340,7 @@ func TestHandlePacket_RebindsSessionWhenMigrationEnabled(t *testing.T) {
 
 	p.sessions.Store("dcid-1", ctx)
 	p.clientSessions.Store(originalAddr.String(), "dcid-1")
+	p.registerDCIDLength(len("dcid-1"))
 
 	packet := append([]byte{0x40}, []byte("dcid-1payload")...)
 	p.handlePacket(newAddr, packet)

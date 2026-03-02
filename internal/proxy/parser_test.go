@@ -130,7 +130,7 @@ func TestParseTLSClientHello_CopiesRawBuffer(t *testing.T) {
 	data[0] = 0x01
 	data[1] = 0x00
 	data[2] = 0x00
-	data[3] = 0x26
+	data[3] = 0x2b
 	data[4] = 0x03
 	data[5] = 0x03
 	data[38] = 0x00
@@ -141,14 +141,15 @@ func TestParseTLSClientHello_CopiesRawBuffer(t *testing.T) {
 	data[43] = 0x01
 	data[44] = 0x00
 	data[45] = 0x00
+	data[46] = 0x00
 
-	hello, err := parseTLSClientHello(data[:46])
+	hello, err := parseTLSClientHello(data[:47])
 	if err != nil {
 		t.Fatalf("parseTLSClientHello failed: %v", err)
 	}
 
-	if len(hello.Raw) != 46 {
-		t.Fatalf("expected raw length 46, got %d", len(hello.Raw))
+	if len(hello.Raw) != 47 {
+		t.Fatalf("expected raw length 47, got %d", len(hello.Raw))
 	}
 
 	data[0] = 0x02
