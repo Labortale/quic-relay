@@ -481,6 +481,7 @@ func (p *Proxy) handlePacket(clientAddr *net.UDPAddr, packet []byte) {
 	}
 	// Set session count for rate limiters
 	newCtx.Set("_session_count", p.sessionCount.Load())
+	newCtx.Set("_reserve_session_slot", p.tryReserveSessionSlot)
 
 	// Set callback to learn server's SCID(s) from response packets
 	// This enables routing subsequent client packets that use server's CID
@@ -491,6 +492,7 @@ func (p *Proxy) handlePacket(clientAddr *net.UDPAddr, packet []byte) {
 	// Process through handler chain
 	result := p.chain.Load().OnConnect(newCtx)
 	if result.Action == handler.Drop {
+		p.releaseReservedSessionSlot(newCtx)
 		if result.Error != nil {
 			log.Printf("[proxy] connection dropped: %v", result.Error)
 		}
@@ -521,6 +523,8 @@ func (p *Proxy) handlePacket(clientAddr *net.UDPAddr, packet []byte) {
 			p.chain.Load().OnDisconnect(newCtx)
 			p.deleteSession(dcidKey, newCtx)
 		}
+	} else {
+		p.releaseReservedSessionSlot(newCtx)
 	}
 }
 
@@ -813,6 +817,29 @@ func (p *Proxy) SessionCount() int {
 	return int(p.sessionCount.Load())
 }
 
+// tryReserveSessionSlot atomically reserves one session slot if below limit.
+func (p *Proxy) tryReserveSessionSlot(limit int64) bool {
+	for {
+		current := p.sessionCount.Load()
+		if current >= limit {
+			return false
+		}
+		if p.sessionCount.CompareAndSwap(current, current+1) {
+			return true
+		}
+	}
+}
+
+// releaseReservedSessionSlot releases a slot that was reserved during OnConnect
+// but never became a stored session.
+func (p *Proxy) releaseReservedSessionSlot(ctx *handler.Context) {
+	if ctx == nil || !ctx.GetBool("_session_reserved") {
+		return
+	}
+	ctx.Set("_session_reserved", false)
+	p.sessionCount.Add(-1)
+}
+
 // deleteSession removes a session and decrements the counter.
 func (p *Proxy) deleteSession(key string, ctx *handler.Context) {
 	if _, loaded := p.sessions.LoadAndDelete(key); loaded {
@@ -831,8 +858,12 @@ func (p *Proxy) deleteSession(key string, ctx *handler.Context) {
 // storeSession stores a session with bounds checking.
 // Triggers cleanup if limit is approached.
 func (p *Proxy) storeSession(key string, ctx *handler.Context) {
-	// O(1) increment
-	count := p.sessionCount.Add(1)
+	var count int64
+	if ctx != nil && ctx.GetBool("_session_reserved") {
+		count = p.sessionCount.Load()
+	} else {
+		count = p.sessionCount.Add(1)
+	}
 
 	// Approaching limit - cleanup oldest 10%
 	if count >= maxSessions*9/10 {
