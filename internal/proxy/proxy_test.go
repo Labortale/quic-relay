@@ -247,3 +247,36 @@ func TestDeleteSession_RemovesTrackedAliases(t *testing.T) {
 		t.Fatal("expected tracked alias set to be removed with the session")
 	}
 }
+
+func TestStorePendingBuffer_EnforcesHardCap(t *testing.T) {
+	p := New(":0", handler.NewChain())
+	p.pendingCount.Store(maxPendingBuffers)
+
+	if p.storePendingBuffer("dcid-1", &pendingBuffer{}) {
+		t.Fatal("expected storePendingBuffer to reject inserts at hard cap")
+	}
+
+	if _, ok := p.pendingPackets.Load("dcid-1"); ok {
+		t.Fatal("pending buffer should not be stored when cap is reached")
+	}
+}
+
+func TestLoadAndDeletePendingBuffer_DecrementsCount(t *testing.T) {
+	p := New(":0", handler.NewChain())
+
+	if !p.storePendingBuffer("dcid-1", &pendingBuffer{}) {
+		t.Fatal("expected pending buffer to be stored")
+	}
+
+	if got := p.pendingCount.Load(); got != 1 {
+		t.Fatalf("expected pendingCount=1, got %d", got)
+	}
+
+	if _, ok := p.loadAndDeletePendingBuffer("dcid-1"); !ok {
+		t.Fatal("expected pending buffer to be deleted")
+	}
+
+	if got := p.pendingCount.Load(); got != 0 {
+		t.Fatalf("expected pendingCount=0 after delete, got %d", got)
+	}
+}

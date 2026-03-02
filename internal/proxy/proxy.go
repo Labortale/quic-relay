@@ -70,6 +70,7 @@ const (
 	// Bounds for maps to prevent unbounded memory growth
 	maxSessions       = 100000
 	maxAssemblers     = 50000
+	maxPendingBuffers = 50000
 	maxPendingPerDCID = 10 // Max buffered packets per DCID
 	cleanupInterval   = 30 * time.Second
 )
@@ -257,6 +258,7 @@ type Proxy struct {
 	assemblers     sync.Map                      // DCID (string) -> *CryptoAssembler
 	assemblerCount atomic.Int64                  // O(1) assembler counter for hard memory cap
 	pendingPackets sync.Map                      // DCID (string) -> *pendingBuffer (out-of-order packets)
+	pendingCount   atomic.Int64                  // O(1) pending buffer counter for hard memory cap
 	dcidAliases    sync.Map                      // Server SCID (string) -> original DCID (string)
 	sessionAliases sync.Map                      // Original DCID (string) -> *aliasSet
 	clientSessions sync.Map                      // Client address (string) -> original DCID (string)
@@ -749,7 +751,7 @@ func (p *Proxy) cleanupSessions() {
 			p.pendingPackets.Range(func(key, value any) bool {
 				buf := value.(*pendingBuffer)
 				if time.Since(buf.createdAt) > assemblerTimeout {
-					p.pendingPackets.Delete(key)
+					p.deletePendingBuffer(key.(string))
 				}
 				return true
 			})
@@ -906,10 +908,10 @@ func (p *Proxy) deleteSessionAliases(originalDCID string) {
 // bufferPendingPacket stores a packet that arrived before its session existed.
 // Used for out-of-order 0-RTT and Handshake packets.
 func (p *Proxy) bufferPendingPacket(dcidKey string, packet []byte) {
-	val, _ := p.pendingPackets.LoadOrStore(dcidKey, &pendingBuffer{
-		createdAt: time.Now(),
-	})
-	buf := val.(*pendingBuffer)
+	buf, ok := p.loadOrCreatePendingBuffer(dcidKey)
+	if !ok {
+		return
+	}
 
 	buf.mu.Lock()
 	defer buf.mu.Unlock()
@@ -925,7 +927,7 @@ func (p *Proxy) bufferPendingPacket(dcidKey string, packet []byte) {
 
 // flushPendingPackets processes buffered packets after session creation.
 func (p *Proxy) flushPendingPackets(dcidKey string, ctx *handler.Context) {
-	val, ok := p.pendingPackets.LoadAndDelete(dcidKey)
+	val, ok := p.loadAndDeletePendingBuffer(dcidKey)
 	if !ok {
 		return
 	}
@@ -938,6 +940,62 @@ func (p *Proxy) flushPendingPackets(dcidKey string, ctx *handler.Context) {
 
 	for _, pkt := range packets {
 		p.chain.Load().OnPacket(ctx, pkt.data, handler.Inbound)
+	}
+}
+
+// loadOrCreatePendingBuffer returns the existing pending buffer for a DCID or
+// creates one while enforcing a hard global cap on outstanding pending buffers.
+func (p *Proxy) loadOrCreatePendingBuffer(key string) (*pendingBuffer, bool) {
+	if val, ok := p.pendingPackets.Load(key); ok {
+		return val.(*pendingBuffer), true
+	}
+
+	buf := &pendingBuffer{
+		createdAt: time.Now(),
+	}
+	if !p.storePendingBuffer(key, buf) {
+		if val, ok := p.pendingPackets.Load(key); ok {
+			return val.(*pendingBuffer), true
+		}
+		return nil, false
+	}
+
+	return buf, true
+}
+
+// storePendingBuffer stores a new pending buffer if the hard cap allows it.
+func (p *Proxy) storePendingBuffer(key string, buf *pendingBuffer) bool {
+	for {
+		count := p.pendingCount.Load()
+		if count >= maxPendingBuffers {
+			return false
+		}
+		if p.pendingCount.CompareAndSwap(count, count+1) {
+			break
+		}
+	}
+
+	if _, loaded := p.pendingPackets.LoadOrStore(key, buf); loaded {
+		p.pendingCount.Add(-1)
+		return false
+	}
+
+	return true
+}
+
+// loadAndDeletePendingBuffer removes a pending buffer and decrements the counter once.
+func (p *Proxy) loadAndDeletePendingBuffer(key string) (any, bool) {
+	val, ok := p.pendingPackets.LoadAndDelete(key)
+	if ok {
+		p.pendingCount.Add(-1)
+	}
+	return val, ok
+}
+
+// deletePendingBuffer removes a pending buffer and decrements the counter once.
+func (p *Proxy) deletePendingBuffer(key string) {
+	if _, ok := p.loadAndDeletePendingBuffer(key); ok {
+		return
 	}
 }
 
