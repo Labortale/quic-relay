@@ -219,3 +219,31 @@ func TestDeleteAssembler_DecrementsCount(t *testing.T) {
 		t.Fatalf("expected assemblerCount=0 after delete, got %d", got)
 	}
 }
+
+func TestDeleteSession_RemovesTrackedAliases(t *testing.T) {
+	p := New(":0", handler.NewChain())
+	ctx := &handler.Context{
+		Session: &handler.Session{},
+	}
+	ctx.Session.SetClientAddr(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345})
+
+	p.sessions.Store("dcid-1", ctx)
+	p.sessionCount.Store(1)
+	p.clientSessions.Store(ctx.Session.ClientAddr().String(), "dcid-1")
+	p.dcidAliases.Store("alias-1", "dcid-1")
+	p.dcidAliases.Store("alias-2", "dcid-1")
+	p.trackSessionAlias("dcid-1", "alias-1")
+	p.trackSessionAlias("dcid-1", "alias-2")
+
+	p.deleteSession("dcid-1", ctx)
+
+	if _, ok := p.dcidAliases.Load("alias-1"); ok {
+		t.Fatal("expected alias-1 to be removed with the session")
+	}
+	if _, ok := p.dcidAliases.Load("alias-2"); ok {
+		t.Fatal("expected alias-2 to be removed with the session")
+	}
+	if _, ok := p.sessionAliases.Load("dcid-1"); ok {
+		t.Fatal("expected tracked alias set to be removed with the session")
+	}
+}

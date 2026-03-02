@@ -86,6 +86,12 @@ type pendingBuffer struct {
 	mu        sync.Mutex
 }
 
+// aliasSet tracks server-issued aliases that belong to a single session.
+type aliasSet struct {
+	aliases map[string]struct{}
+	mu      sync.Mutex
+}
+
 // NewCryptoAssembler creates a new assembler with pre-allocated buffer
 func NewCryptoAssembler() *CryptoAssembler {
 	return &CryptoAssembler{
@@ -252,6 +258,7 @@ type Proxy struct {
 	assemblerCount atomic.Int64                  // O(1) assembler counter for hard memory cap
 	pendingPackets sync.Map                      // DCID (string) -> *pendingBuffer (out-of-order packets)
 	dcidAliases    sync.Map                      // Server SCID (string) -> original DCID (string)
+	sessionAliases sync.Map                      // Original DCID (string) -> *aliasSet
 	clientSessions sync.Map                      // Client address (string) -> original DCID (string)
 	workerPool     *WorkerPool
 	ctx            context.Context
@@ -653,6 +660,7 @@ func (p *Proxy) learnServerSCID(originalDCID string, ctx *handler.Context, datag
 
 		// Store alias: server's SCID -> original DCID
 		p.dcidAliases.Store(scidKey, originalDCID)
+		p.trackSessionAlias(originalDCID, scidKey)
 
 		// Track SCID length for Short Header parsing
 		p.registerDCIDLength(len(scid))
@@ -806,10 +814,10 @@ func (p *Proxy) SessionCount() int {
 }
 
 // deleteSession removes a session and decrements the counter.
-// Note: DCID aliases are cleaned up by timeout-based cleanup.
 func (p *Proxy) deleteSession(key string, ctx *handler.Context) {
 	if _, loaded := p.sessions.LoadAndDelete(key); loaded {
 		p.sessionCount.Add(-1)
+		p.deleteSessionAliases(key)
 
 		// O(1) - directly delete using known client address from context
 		if ctx != nil && ctx.Session != nil {
@@ -832,6 +840,36 @@ func (p *Proxy) storeSession(key string, ctx *handler.Context) {
 	}
 
 	p.sessions.Store(key, ctx)
+}
+
+// trackSessionAlias records an alias for later cleanup when the session ends.
+func (p *Proxy) trackSessionAlias(originalDCID, alias string) {
+	val, _ := p.sessionAliases.LoadOrStore(originalDCID, &aliasSet{
+		aliases: make(map[string]struct{}),
+	})
+	set := val.(*aliasSet)
+
+	set.mu.Lock()
+	set.aliases[alias] = struct{}{}
+	set.mu.Unlock()
+}
+
+// deleteSessionAliases removes all aliases learned for a session.
+func (p *Proxy) deleteSessionAliases(originalDCID string) {
+	val, ok := p.sessionAliases.LoadAndDelete(originalDCID)
+	if !ok {
+		return
+	}
+
+	set := val.(*aliasSet)
+	set.mu.Lock()
+	defer set.mu.Unlock()
+
+	for alias := range set.aliases {
+		if mapped, ok := p.dcidAliases.Load(alias); ok && mapped.(string) == originalDCID {
+			p.dcidAliases.Delete(alias)
+		}
+	}
 }
 
 // bufferPendingPacket stores a packet that arrived before its session existed.
