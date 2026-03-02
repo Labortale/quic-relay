@@ -772,7 +772,7 @@ func parseTLSClientHello(data []byte) (*handler.ClientHello, error) {
 
 	// Parse extensions
 	hello := &handler.ClientHello{
-		Raw: data,
+		Raw: append([]byte(nil), data...),
 	}
 
 	extEnd := offset + extensionsLen
